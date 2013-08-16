@@ -22,6 +22,78 @@ enum {
 	CMD_WR_GATE_N		= 0x00
 };
 
+// CRC-16/CCITT implementation
+// Based on code from http://www.sanity-free.org/133/crc_16_ccitt_in_csharp.html
+class CRC16 {
+	private:
+		static const unsigned int poly = 4129;
+		unsigned int table[256];
+		unsigned int crcval, initval;
+	public:
+		CRC16(const unsigned int initval = 0xFFFF) {
+			this->initval = this->crcval = initval;
+
+			unsigned int temp, a;
+			for (size_t i=0; i<(sizeof(this->table)/sizeof(this->table[0])); ++i) {
+				temp = 0;
+
+				a = (unsigned int) i << 8;
+				
+				for (int j=0; j < 8; ++j) {
+					if(((temp ^ a) & 0x8000) != 0) {
+						temp = (unsigned int)((temp << 1) ^ poly);
+					} else {
+						temp <<= 1;
+					}
+					a <<= 1;
+				}
+
+				table[i] = temp;
+			}
+		}
+
+		// calculate crc without updating internal state
+		unsigned int calculate(const void *buf, const size_t len) {
+			unsigned int crc = this->crcval;
+
+			for (size_t i=0; i<len; i++) {
+				char x = ((unsigned char *)buf)[i];
+				crc = ((crc << 8) ^ this->table[((crc >> 8) ^ x) & 0xff]) & 0xffff;
+			}
+
+			return crc;
+		}
+
+		// calculate crc and update internal state afterwards
+		// used for partial crcs
+		unsigned int update(const void *buf, const size_t len) {
+			this->crcval = this->calculate(buf, len);
+			return this->crcval;
+		}
+
+		// calculate crc and update internal state afterwards
+		// used for partial crcs
+		unsigned int update(const uint8_t ch) {
+			this->crcval = this->calculate(&ch, 1);
+			return this->crcval;
+		}
+
+
+		// reset crc to initialisation default
+		void reset(void) {
+			this->crcval = this->initval;
+		}
+
+		// reset crc to arbitrary value and change init default accordingly
+		void reset(unsigned int initval) {
+			this->crcval = this->initval = initval;
+		}
+
+		unsigned int crc() {
+			return this->crcval;
+		}
+};
+
 class Track {
 	private:
 		vector<uint8_t> _buf;
@@ -130,6 +202,7 @@ class BitTrack {
 				// clock = prev NOR curr
 				_buf.push_back(!(_last_data_bit | this_bit));
 				// data is always data
+				_buf.push_back(this_bit);
 				_last_data_bit = this_bit;
 			}
 		}
@@ -142,6 +215,7 @@ class BitTrack {
 				// clock is always true
 				_buf.push_back(true);
 				// data is always data
+				_buf.push_back(this_bit);
 				_last_data_bit = this_bit;
 			}
 		}
@@ -163,7 +237,7 @@ class BitTrack {
 					 * We add 1 here because there's a minimum gap of 1 cell between adjacent flux transitions.
 					 * Each element in the _buf vector is 1 if there is a transition in that cell.
 					 */
-					t.emit_flux((nzeroes + 1) * cell_time);
+					t.emit_flux((cell_time / 2) + (nzeroes * (cell_time/2)));
 					nzeroes = 0;
 				} else {
 					// '0' bit -- increment the "number of zeroes seen" value
@@ -195,7 +269,7 @@ int main(void)
 	assert(discferret_fpga_load_default(dh) == DISCFERRET_E_OK);
 
 	printf("write...\n");
-	uint32_t clock = 200e6;
+	uint32_t clock = 100e6;
 	// Start preparing write data
 	Track t;
 
@@ -221,25 +295,33 @@ int main(void)
 	uint8_t track = 0;
 	uint8_t side = 0;
 	uint8_t crc0, crc1;
-	uint8_t data[256] = {0xff};
+	uint8_t data[512] = {0xff};
 
-	for (int sector=0; sector<26; sector++) {
+	for (int sector=0; sector<9; sector++) {
 		// SYNC
 		for (int i=0; i<12; i++)
 			bt.mfm(0x00);
 
+		CRC16 crc = CRC16();
+
 		// IDAM
-		for (int i=0; i<3; i++)
+		for (int i=0; i<3; i++) {
 			bt.raw(0x4489);		// 0xA1 with missing clock between 4 and 5 -- before IDAM or DAM
-		bt.mfm(0xFE);			// IDAM -- ID Address Mark
+			crc.update(0xA1);
+		}
+
+/// emit and update crc
+#define G(x) { bt.mfm(x); crc.update(x); }
+
+		G(0xFE);		// IDAM -- ID Address Mark
 
 		// ID Record starts here
-		bt.mfm(track);
-		bt.mfm(side);
-		bt.mfm(sector);
-		bt.mfm(0x01);	// sector length
-		bt.mfm(crc0);	// CRC16
-		bt.mfm(crc1);	// CRC16
+		G(track);
+		G(side);
+		G(sector);
+		G(0x01);					// sector length
+		G(crc.crc() >> 8);			// CRC16
+		G(crc.crc() & 0xFF);
 
 		// GAP2
 		for (int i=0; i<22; i++)
@@ -249,24 +331,34 @@ int main(void)
 		for (int i=0; i<12; i++)
 			bt.mfm(0x00);
 
+		crc.reset();
 		// Data Record starts here
-		for (int i=0; i<3; i++)		// 3x A1-sync
+		for (int i=0; i<3; i++) {	// 3x A1-sync
 			bt.raw(0x4489);
-		bt.mfm(0xFB);				// Data Address Mark
-		for (int i=0; i<256; i++)	// Data payload
-			bt.mfm(data[i]);
-		bt.mfm(crc0);				// CRC16
-		bt.mfm(crc1);				// CRC16
+			crc.update(0xA1);
+		}
+		G(0xFB);					// Data Address Mark
+		for (int i=0; i<sizeof(data); i++) {	// Data payload
+			G(data[i]);
+		}
+		G(crc0);					// CRC16
+		G(crc1);					// CRC16
 
 		for (int i=0; i<54; i++)	// GAP3 -- Data gap. 66 bytes. (54 + the 12 at the start of sector)
 			bt.mfm(0x4E);
+#undef G
 	}
 
-	for (int i=0; i<598; i++)		// GAP4b -- Postgap
+	for (int i=0; i<348; i++)		// GAP4b -- Postgap
 		bt.mfm(0x4E);
 
+	/***
+	 * DiscFerret clock = 100MHz = 10ns/clk
+	 *
+	 * Data rate = 250kbps = 4us/cell
+	 */
 
-	bt.toTrack(t, 200);		// 10ns per clock @ 100MHz
+	bt.toTrack(t, 400);		// 10ns per clock @ 100MHz
 							// 2us per cell = 2000ns;   2000/10 = 200 counts
 
 /*
@@ -310,7 +402,7 @@ int main(void)
 		return -1;
 	}
 
-	printf("time to write %u clocks (%0.2f ms)\n", t.get_time(), ((float)t.get_time() / (float)clock) * 1000.0);
+	printf("time to write %u clocks (%0.2f ms)\n", t.get_time(), ((float)t.get_time() / (float)clock));
 
 	// copy buffer to discferret ram
 	uint8_t *ram = new uint8_t[t.get_buf(NULL)];
@@ -345,8 +437,8 @@ int main(void)
 
 	// Turn the disc drive motor on
 	//discferret_reg_poke(dh, DISCFERRET_R_DRIVE_CONTROL, DISCFERRET_DRIVE_CONTROL_DS0 | DISCFERRET_DRIVE_CONTROL_MOTEN | DISCFERRET_DRIVE_CONTROL_DS2);
-	//discferret_reg_poke(dh, DISCFERRET_R_DRIVE_CONTROL, DISCFERRET_DRIVE_CONTROL_DS0 | DISCFERRET_DRIVE_CONTROL_DS2);
-	discferret_reg_poke(dh, DISCFERRET_R_DRIVE_CONTROL, DISCFERRET_DRIVE_CONTROL_DS1 | DISCFERRET_DRIVE_CONTROL_MOTEN);
+	discferret_reg_poke(dh, DISCFERRET_R_DRIVE_CONTROL, DISCFERRET_DRIVE_CONTROL_DS0 | DISCFERRET_DRIVE_CONTROL_DS2);
+	//discferret_reg_poke(dh, DISCFERRET_R_DRIVE_CONTROL, DISCFERRET_DRIVE_CONTROL_DS1 | DISCFERRET_DRIVE_CONTROL_MOTEN);
 	sleep(2);
 	double indx;
 	discferret_get_index_frequency(dh, true, &indx);
