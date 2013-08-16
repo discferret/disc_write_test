@@ -289,13 +289,27 @@ int main(void)
 	for (int i=0; i<3; i++)
 		bt.raw(0x5224);			// 0xC2 with missing clock between 3 and 4 -- before IAM -- Index Mark
 	bt.mfm(0xFC);				// IAM -- Index Address Mark
+
 	for (int i=0; i<50; i++)
 		bt.mfm(0x4E);			// GAP1 - Postindex Gap
 
 	uint8_t track = 0;
 	uint8_t side = 0;
 	uint8_t crc0, crc1;
-	uint8_t data[512] = {0xff};
+	uint8_t data[512];
+
+	for (int i=0; i<sizeof(data); i++)
+		data[i] = 0x5A;
+
+	/**
+	 * Sector length byte (N):
+	 *   00   128
+	 *   01   256
+	 *   02   512
+	 *   03   1024
+	 *   04   2048
+	 *   05   4096
+	 */
 
 	for (int sector=0; sector<9; sector++) {
 		// SYNC
@@ -319,7 +333,7 @@ int main(void)
 		G(track);
 		G(side);
 		G(sector);
-		G(0x01);					// sector length
+		G(0x02);					// sector length
 		G(crc.crc() >> 8);			// CRC16
 		G(crc.crc() & 0xFF);
 
@@ -344,12 +358,12 @@ int main(void)
 		G(crc0);					// CRC16
 		G(crc1);					// CRC16
 
-		for (int i=0; i<54; i++)	// GAP3 -- Data gap. 66 bytes. (54 + the 12 at the start of sector)
+		for (int i=0; i<0x50; i++)	// GAP3 -- Data gap
 			bt.mfm(0x4E);
 #undef G
 	}
 
-	for (int i=0; i<348; i++)		// GAP4b -- Postgap
+	for (int i=0; i<145; i++)		// GAP4b -- Postgap -- ideally this should continue to the index pulse
 		bt.mfm(0x4E);
 
 	/***
@@ -402,7 +416,7 @@ int main(void)
 		return -1;
 	}
 
-	printf("time to write %u clocks (%0.2f ms)\n", t.get_time(), ((float)t.get_time() / (float)clock));
+	printf("time to write %u clocks (%0.2f ms)\n", t.get_time(), ((float)t.get_time() / (float)clock) * 1000.0);
 
 	// copy buffer to discferret ram
 	uint8_t *ram = new uint8_t[t.get_buf(NULL)];
