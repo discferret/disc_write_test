@@ -226,18 +226,46 @@ class BitTrack {
 		 * @param t Track class
 		 * @param cell_time Time for one bit cell
 		 */
-		void toTrack(Track &t, uint32_t cell_time)
+		void toTrack(Track &t, uint32_t cell_time, unsigned int precomp = 0)
 		{
 			uint32_t nzeroes = 0;
+			uint8_t shiftreg = 0;
+			int n = 0;
 
-			for (std::vector<bool>::iterator bit = _buf.begin(); bit != _buf.end(); ++bit) {
-				if (*bit) {
+			for (size_t pos = 0; pos < _buf.size() + 2; pos++) {
+				bool bit = (pos < _buf.size()) ? _buf[pos] : 0;
+				shiftreg = (shiftreg << 1) | (bit ? 1 : 0);
+
+				// 2-bit delay through the shift register
+				if (n < 2) {
+					n++;
+					continue;
+				}
+
+				// figure out if we need to apply precompensation
+				signed int precomp_mul;
+				switch (shiftreg & 0x1F) {
+					case 0x05:	// 00101 (MFM x011) - causes early shift
+						precomp_mul = 1;
+						break;
+					case 0x14:	// 10100 (MFM x110) - causes late shift
+						precomp_mul = -1;
+						break;
+					default:
+						precomp_mul = 0;
+						break;
+				}
+
+				// grab the bit out of the shift register
+				bit = shiftreg & 4;
+
+				if (bit) {
 					/***
 					 * '1' bit. Calculate time delta and emit a flux transition.
 					 * We add 1 here because there's a minimum gap of 1 cell between adjacent flux transitions.
 					 * Each element in the _buf vector is 1 if there is a transition in that cell.
 					 */
-					t.emit_flux((cell_time / 2) + (nzeroes * (cell_time/2)));
+					t.emit_flux((cell_time / 2) + (nzeroes * (cell_time/2)) + (precomp_mul * precomp));
 					nzeroes = 0;
 				} else {
 					// '0' bit -- increment the "number of zeroes seen" value
@@ -299,7 +327,7 @@ int main(void)
 	uint8_t data[512];
 
 	for (int i=0; i<sizeof(data); i++)
-		data[i] = 0x5A;
+		data[i] = rand();
 
 	/**
 	 * Sector length byte (N):
@@ -372,8 +400,10 @@ int main(void)
 	 * Data rate = 250kbps = 4us/cell
 	 */
 
-	bt.toTrack(t, 400);		// 10ns per clock @ 100MHz
-							// 2us per cell = 2000ns;   2000/10 = 200 counts
+	bt.toTrack(t, 400, 13);		// 10ns per clock @ 100MHz
+							// 4us per cell = 4000ns;   4000/10 = 200 counts
+							// 250ns precomp / 10ns = 25 counts
+							// 125ns precomp / 10ns = 12.5 counts (rounds up to 13)
 
 /*
 	// Some flux transitions...
