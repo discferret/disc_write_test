@@ -7,274 +7,12 @@
 
 #include "discferret/discferret.h"
 
+#include "CRC16.h"
+#include "Track.h"
+#include "BitTrack.h"
+#include "imagedisk.h"
+
 using namespace std;
-
-typedef enum { 
-	WRGATE_WRITE,
-	WRGATE_READ
-} WRITE_GATE;
-enum {
-	CMD_WAIT_TIMER_N	= 0x80,
-	CMD_WAIT_INDEX_N	= 0x40,
-	CMD_STOP			= 0x3F,
-	CMD_WAIT_HSTMD		= 0x03,
-	CMD_TRANSITION		= 0x02,
-	CMD_WR_GATE_N		= 0x00
-};
-
-// CRC-16/CCITT implementation
-// Based on code from http://www.sanity-free.org/133/crc_16_ccitt_in_csharp.html
-class CRC16 {
-	private:
-		static const unsigned int poly = 4129;
-		unsigned int table[256];
-		unsigned int crcval, initval;
-	public:
-		CRC16(const unsigned int initval = 0xFFFF) {
-			this->initval = this->crcval = initval;
-
-			unsigned int temp, a;
-			for (size_t i=0; i<(sizeof(this->table)/sizeof(this->table[0])); ++i) {
-				temp = 0;
-
-				a = (unsigned int) i << 8;
-				
-				for (int j=0; j < 8; ++j) {
-					if(((temp ^ a) & 0x8000) != 0) {
-						temp = (unsigned int)((temp << 1) ^ poly);
-					} else {
-						temp <<= 1;
-					}
-					a <<= 1;
-				}
-
-				table[i] = temp;
-			}
-		}
-
-		// calculate crc without updating internal state
-		unsigned int calculate(const void *buf, const size_t len) {
-			unsigned int crc = this->crcval;
-
-			for (size_t i=0; i<len; i++) {
-				char x = ((unsigned char *)buf)[i];
-				crc = ((crc << 8) ^ this->table[((crc >> 8) ^ x) & 0xff]) & 0xffff;
-			}
-
-			return crc;
-		}
-
-		// calculate crc and update internal state afterwards
-		// used for partial crcs
-		unsigned int update(const void *buf, const size_t len) {
-			this->crcval = this->calculate(buf, len);
-			return this->crcval;
-		}
-
-		// calculate crc and update internal state afterwards
-		// used for partial crcs
-		unsigned int update(const uint8_t ch) {
-			this->crcval = this->calculate(&ch, 1);
-			return this->crcval;
-		}
-
-
-		// reset crc to initialisation default
-		void reset(void) {
-			this->crcval = this->initval;
-		}
-
-		// reset crc to arbitrary value and change init default accordingly
-		void reset(unsigned int initval) {
-			this->crcval = this->initval = initval;
-		}
-
-		unsigned int crc() {
-			return this->crcval;
-		}
-};
-
-class Track {
-	private:
-		vector<uint8_t> _buf;
-		WRITE_GATE _gate_state = WRGATE_READ;
-		uint32_t _timestep = 0;
-
-	public:
-		void reset(void)
-		{
-			_buf.clear();
-			_timestep = 0;
-			_gate_state = WRGATE_READ;
-		}
-
-		uint32_t get_time(void)
-		{
-			return _timestep;
-		}
-
-		size_t get_buf(uint8_t *dest)
-		{
-			if (dest != NULL) {
-				for (size_t i=0; i < _buf.size(); i++) {
-					dest[i] = _buf[i];
-				}
-			}
-			return _buf.size();
-		}
-
-		void emit_wrgate(WRITE_GATE state)
-		{
-			_gate_state = state;
-			if (state == WRGATE_WRITE) {
-				_buf.push_back(CMD_WR_GATE_N + 1);
-			} else {
-				_buf.push_back(CMD_WR_GATE_N + 0);
-			}
-			_timestep++;
-		}
-
-		void emit_flux(uint32_t time)
-		{
-			uint32_t t = time;
-
-			while (t > 0) {
-				if (t > 129) {
-					_buf.push_back(CMD_WAIT_TIMER_N + 127);
-					t = t - 129;
-				} else if (t >= 2) {
-					_buf.push_back(CMD_WAIT_TIMER_N + (t - 2));
-					t = 0;
-				} else {
-					this->emit_wrgate(this->_gate_state);
-					t = t - 1;
-				}
-			}
-			_buf.push_back(CMD_TRANSITION);
-			_timestep += time + 1;
-		}
-
-		void emit_wait_index(int n=1)
-		{
-			assert(n > 0);
-
-			while (n > 0) {
-				int x = (n > 0x3F) ? 0x3F : n;
-				n -= x;
-				_buf.push_back(CMD_WAIT_INDEX_N + x);
-			}
-		}
-		
-		void emit_stop()
-		{
-			_buf.push_back(CMD_STOP);
-		}
-};
-
-class BitTrack {
-	private:
-		bool _last_data_bit;
-
-	public:
-		vector<bool> _buf;
-
-		void reset(void)
-		{
-			_buf.clear();
-			_last_data_bit = false;
-		}
-
-		void raw(uint32_t data, size_t nbits=16)
-		{
-			assert(nbits <= 32);
-
-			for (unsigned int i=1; i <= nbits; i++) {
-				_buf.push_back(data & (1 << (nbits-i)));
-			}
-			_last_data_bit = data & 1;
-		}
-
-		void mfm(uint8_t data)
-		{
-			for (unsigned int i=1; i <= 8; i++) {
-				bool this_bit = data & (1 << (8 - i));
-
-				// clock = prev NOR curr
-				_buf.push_back(!(_last_data_bit | this_bit));
-				// data is always data
-				_buf.push_back(this_bit);
-				_last_data_bit = this_bit;
-			}
-		}
-
-		void fm(uint8_t data)
-		{
-			for (unsigned int i=1; i <= 8; i++) {
-				bool this_bit = data & (1 << (8 - i));
-
-				// clock is always true
-				_buf.push_back(true);
-				// data is always data
-				_buf.push_back(this_bit);
-				_last_data_bit = this_bit;
-			}
-		}
-
-		/**
-		 * @brief Convert the contents of the BitTrack into a track.
-		 *
-		 * @param t Track class
-		 * @param cell_time Time for one bit cell
-		 */
-		void toTrack(Track &t, uint32_t cell_time, unsigned int precomp = 0)
-		{
-			uint32_t nzeroes = 0;
-			uint8_t shiftreg = 0;
-			int n = 0;
-
-			for (size_t pos = 0; pos < _buf.size() + 2; pos++) {
-				bool bit = (pos < _buf.size()) ? _buf[pos] : 0;
-				shiftreg = (shiftreg << 1) | (bit ? 1 : 0);
-
-				// 2-bit delay through the shift register
-				if (n < 2) {
-					n++;
-					continue;
-				}
-
-				// figure out if we need to apply precompensation
-				signed int precomp_mul;
-				switch (shiftreg & 0x1F) {
-					case 0x05:	// 00101 (MFM x011) - causes early shift
-						precomp_mul = 1;
-						break;
-					case 0x14:	// 10100 (MFM x110) - causes late shift
-						precomp_mul = -1;
-						break;
-					default:
-						precomp_mul = 0;
-						break;
-				}
-
-				// grab the bit out of the shift register
-				bit = shiftreg & 4;
-
-				if (bit) {
-					/***
-					 * '1' bit. Calculate time delta and emit a flux transition.
-					 * We add 1 here because there's a minimum gap of 1 cell between adjacent flux transitions.
-					 * Each element in the _buf vector is 1 if there is a transition in that cell.
-					 */
-					t.emit_flux((cell_time / 2) + (nzeroes * (cell_time/2)) + (precomp_mul * precomp));
-					nzeroes = 0;
-				} else {
-					// '0' bit -- increment the "number of zeroes seen" value
-					nzeroes++;
-				}
-			}
-		}
-};
-
 
 int main(void)
 {
@@ -295,6 +33,12 @@ int main(void)
 	// Load microcode
 	printf("downloading microcode...\n");
 	assert(discferret_fpga_load_default(dh) == DISCFERRET_E_OK);
+
+	// Load ImageDisk file
+	fstream f("01_Diagnostic_Disk_Ver_3.51.IMD", ios::in | ios::binary);
+	IMDImage imd(f);
+
+	return 0;
 
 	printf("write...\n");
 	uint32_t clock = 100e6;
@@ -405,36 +149,9 @@ int main(void)
 							// 250ns precomp / 10ns = 25 counts
 							// 125ns precomp / 10ns = 12.5 counts (rounds up to 13)
 
-/*
-	// Some flux transitions...
-	//for (int i=0; i<20000; i++) {
-	while (t.get_buf(NULL) < 500*1024) {
-		t.emit_flux(800);
-		//t.emit_flux(600);
-		t.emit_flux(400);
-	}
-*/
-/*
-	t.emit_stop();
-
-	for (int i=0; i<20000; i++) {
-		t.emit_flux(150);
-	}
-	for (int i=0; i<20000; i++) {
-		t.emit_flux(200);
-	}
-	for (int i=0; i<20000; i++) {
-		t.emit_flux(250);
-	}
-*/
 	// write DC to EOT
 	//t.emit_wait_index();
 	t.emit_wrgate(WRGATE_READ);
-
-	// pointless wait
-//	t.emit_wait_index();
-//	t.emit_wait_index();
-//	t.emit_wait_index();
 
 	// end of program
 	t.emit_stop();
